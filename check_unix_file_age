@@ -1,0 +1,363 @@
+#!/usr/bin/perl -w
+
+
+# nagios check to alert if a file last modification date is greater than X
+# used for checking things list the last time a backup logfile was updated
+
+ 
+# CHANGE LOG
+# ----------
+#  2022/04/16	njeffrey	Script created
+
+
+
+
+
+# NOTES
+# -----
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  There is an "official" nagios plugin called check_file_age, which can be installed with yum install nagios-plugins-file_age
+#  However, the official plugin has dependencies on multiple perl moduules that do not exist on all UNIX-like operating systems,
+#  so this plugin requires nothing but base perl, so is easier to use on non-Linux systems like AIX.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking last modification time of a file
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             file age myfile.txt
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_file_age --file=/path/to/myfile.txt --warn=24h --crit=48h"
+#           }
+#
+#  If you are using the check_nrpe method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking time synchronization
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             file age myfile.txt
+#           check_command                   check_nrpe!check_unix_file_age -t 30
+#           }
+#
+#  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
+#   command[check_file_age]=/usr/local/nagios/libexec/check_file_age
+#
+#
+
+
+
+
+# ASSUMPTIONS
+# -----------
+#  It is assumed that perl is installed on the machine running this script.
+#     For RHEL / CentOS     yum install perl
+#     For AIX		    perl should already be in the base install
+#
+#
+#  It is assumed that this script is being run as a low-privileged user (typically nagios)
+#  This does mean that the check cannot report on files that the nagios user has no list permission to.
+#
+#
+
+
+
+
+
+# TROUBLESHOOTING
+# ---------------
+# 1) This script will not be able to determine the file age of a file that the low-privileged nagios user does not have access to.  
+#    HINT: having read or execute permission on the file is sufficient, because we only need to see the file date, but not the file contents.
+#    This script only considers standard rwxrwxrwx UNIX permissions, and does not consider any filesystem extended ACLs.
+#    For example:
+#    $ ls -l /etc/shadow
+#    ---------- 1 root root 1288 Jan 10 13:49 /etc/shadow
+#    $ ./check_unix_file_age --file=/etc/shadow --warn=90d --crit=95d
+#    File Age UNKNOWN -  /etc/shadow is not readable by the current user
+#    
+#   $ ls -l /tmp/testfile1
+#   -rwxrwx--- 1 root root 0 Apr 16 14:37 /tmp/testfile1
+#   $ /usr/local/nagios/libexec/check_unix_file_age --file=/tmp/testfile1 --warn=90d --crit=95d
+#   File Age UNKNOWN -  /tmp/testfile1 is not readable or executable by the current user
+#  
+#   $ ls -l /tmp/testfile2
+#   -rwxrwx--x 1 root root 0 Apr 13 14:38 /tmp/testfile2
+#   $ ./check_unix_file_age --file=/tmp/testfile2 --warn=90d --crit=95d
+#   File Age OK - filename /tmp/testfile2 last modification date is 3 days, warn at 90 days, critical at 95 days
+#
+#   $ ls -l /tmp/testfile3
+#   -rw-rw-r-- 1 root root 0 Apr 13 14:40 /tmp/testfile3
+#   $ ./check_unix_file_age --file=/tmp/testfile3 --warn=90d --crit=95d
+#   File Age OK - filename /tmp/testfile3 last modification date is 3 days, warn at 90 days, critical at 95 days 
+
+
+
+
+
+use strict;						#enforce good coding practices
+use Getopt::Long;                       		#allow --long-switches to be used as parameters
+
+#declare variables
+my ($verbose);
+my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+my ($perf_data);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+my ($opt_h,$opt_v,$opt_f,$opt_w,$opt_c,$opt_i);
+my ($file_name,$file_age,%file_details,$ignore);
+my ($warn_threshold,$crit_threshold);
+my ($default_warn_threshold,$default_crit_threshold);
+$verbose            = "no";				#yes/no flag to increase verbosity during debugging
+$perf_data          = "";                               #nagios performance data included in output
+$CHECK_NAME         = "File Age";
+$default_warn_threshold = 86400;			#default warn threshold is  86400 seconds (1 day)
+$default_crit_threshold = 172800;			#default warn threshold is 172800 seconds (2 days)
+
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "Running get_options subroutine \n" if ($verbose eq "yes");
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"      => \$opt_v,
+      "f=s" => \$opt_f, "file=s"      => \$opt_f,
+      "w=i" => \$opt_w, "warn=s"      => \$opt_w,
+      "c=i" => \$opt_c, "crit=s"      => \$opt_c,
+      "i"   => \$opt_i, "ignore"      => \$opt_i,
+   );
+   #
+   # If the user supplied the -h or --help switch, give them some help.
+   #
+   if( defined( $opt_h ) ) {
+      print "Use this syntax \n";
+      print "   $0 \n";
+      print "   $0 --file=/path/to/myfile.txt   (assumes nagios user has at least list access to file) \n";
+      print "   $0 --warn=24h --crit=48h        (alert thresholds s=seconds h=hours d=days, defaults to seconds if unit not provided) \n";
+      print "   $0 --ignore                     (do not alert if file is missing) \n";
+      print "   $0 --verbose                    (increase output for debugging) \n";
+      exit $UNKNOWN;				#exit script
+   }
+   #
+   # If the user supplied the --verbose switch, increase output verbosity
+   #
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } else {
+      $verbose = "no";
+   }
+   #
+   # add section for --warn
+   if( defined( $opt_w ) ) {
+      $warn_threshold = $opt_w;
+   } else {
+      $warn_threshold = $default_warn_threshold;
+   }
+   #
+   # add section for --crit
+   if( defined( $opt_c ) ) {
+      $crit_threshold = $opt_c;
+   } else {
+      $crit_threshold = $default_crit_threshold;
+   }
+   #
+   # add section for --ignore
+   if( defined( $opt_i ) ) {
+      $ignore = "yes";
+   }
+   #
+   # add section for --file=/path/to/myfile.txt
+   if( defined( $opt_f ) ) {
+      $file_name = $opt_f;
+   } else {
+      print "$CHECK_NAME UNKNOWN - filename not provided with --file=path/to/filename.txt, use --help parameter for help. \n";
+     exit $UNKNOWN;
+   }		
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   print "Running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # If the file does not exist, and the --ignore parameter was provided, exit script
+   if ( (! -f "$file_name") && (defined($ignore)) ) {
+      print "$CHECK_NAME OK - skipping file age check, $file_name does not exist \n";
+      exit $OK;
+   }
+   #
+   # confirm the file date can be determined by the current user
+   #
+   if ( ! -f "$file_name" ) {
+      print "$CHECK_NAME CRITICAL - Cannot find file $file_name \n";
+      exit $CRITICAL;
+   }
+   # We do not really care if the file contents are not readable, as long as we can get the file date
+   # In other words, having read or execute privilege will be enough to get the file date.
+   if ( (! -r "$file_name") && (! -x "$file_name") ) {  
+      print "$CHECK_NAME UNKNOWN -  $file_name is not readable or executable by the current user \n";
+      exit $UNKNOWN;
+   }
+
+}						#end of subroutine
+
+
+
+
+
+sub get_file_age {
+   #
+   print "Running get_file_age subroutine \n" if ($verbose eq "yes");
+   #
+   ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($file_name); #get last modification time in seconds since the epoch
+   $file_age = time - $mtime;                                 				#figure out how many seconds old the file is
+   print "   file $file_name is $file_age seconds old \n" if ($verbose eq "yes");
+   $file_details{name}        = $file_name;						#save filename in hash
+   $file_details{age_seconds} = $file_age;						#save age in seconds in hash
+   $file_details{age_minutes} = sprintf( "%.0f",$file_details{age_seconds}/60);		#convert seconds to minutes, truncate to zero decimal places
+   $file_details{age_hours}   = sprintf( "%.0f",$file_details{age_seconds}/60/60);	#convert seconds to hours,   truncate to zero decimal places
+   $file_details{age_days}    = sprintf( "%.0f",$file_details{age_seconds}/60/60/24);	#convert seconds to days,    truncate to zero decimal places
+}											#end of subroutine
+
+
+sub verify_units {
+   #
+   print "Running verify_units subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine figures out if the thresholds are defined in seconds / minutes / hours / days
+   # if --warn=## --crit=## are given without units, assume seconds
+   # acceptable units are s=seconds h=hours d=days
+   # mixing and matching are NOT permitted, for example --warn=24h --crit=2d
+   #
+   # Check the contents of the --warn= parameter
+   #
+   if ( $warn_threshold =~ /[0-9]+$/ ) {						#threshold not provided, so assume it is seconds
+      $file_details{preferred_unit_warn} = "seconds";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
+   }											#end of if block
+   if ( $warn_threshold =~ /[0-9]+s/ ) {						#threshold is in seconds
+      $file_details{preferred_unit_warn} = "seconds";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
+      chop $warn_threshold;								#remove the trailing unit (seconds) so we can do integer comparisons
+   }											#end of if block
+   if ( $warn_threshold =~ /[0-9]+m/ )  {						#threshold is in minutes
+      $file_details{preferred_unit_warn} = "minutes";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_minutes};			#save appropriate unit measurement
+      chop $warn_threshold;								#remove the trailing unit (minutes) so we can do integer comparisons
+   }											#end of if block
+   if ( $warn_threshold =~ /[0-9]+h/ )  {						#threshold is in hours
+      $file_details{preferred_unit_warn} = "hours";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_hours};			#save appropriate unit measurement
+      chop $warn_threshold;								#remove the trailing unit (hours) so we can do integer comparisons
+   }											#end of if block
+   if ( $warn_threshold =~ /[0-9]+d/ )  {						#threshold is in days
+      $file_details{preferred_unit_warn} = "days";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_days};			#save appropriate unit measurement
+      chop $warn_threshold;								#remove the trailing unit (days) so we can do integer comparisons
+   }											#end of if block
+   unless ( $file_details{preferred_unit_warn} =~ /[a-z]/ ) {				#confirm we have a valid unit 
+      print "$CHECK_NAME UNKNOWN - could not determine unit of measurement as seconds/minutes/hours/days.  Please check --warn=## --crit=## parameters. \n";
+      exit $UNKNOWN;
+   }											#end of unless block
+   #
+   # Check the contents of the --crit= parameter
+   #
+   if ( $crit_threshold =~ /[0-9]+$/ ) {						#threshold not provided, so assume it is seconds
+      $file_details{preferred_unit_crit} = "seconds";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
+   }											#end of if block
+   if ( $crit_threshold =~ /[0-9]+s/ ) {						#threshold is in seconds
+      $file_details{preferred_unit_crit} = "seconds";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
+      chop $crit_threshold;								#remove the trailing unit (seconds) so we can do integer comparisons
+   }											#end of if block
+   if ( $crit_threshold =~ /[0-9]+m/ )  {						#threshold is in minutes
+      $file_details{preferred_unit_crit} = "minutes";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_minutes};			#save appropriate unit measurement
+      chop $crit_threshold;								#remove the trailing unit (minutes) so we can do integer comparisons
+   }											#end of if block
+   if ( $crit_threshold =~ /[0-9]+h/ )  {						#threshold is in hours
+      $file_details{preferred_unit_crit} = "hours";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_hours};			#save appropriate unit measurement
+      chop $crit_threshold;								#remove the trailing unit (hours) so we can do integer comparisons
+   }											#end of if block
+   if ( $crit_threshold =~ /[0-9]+d/ )  {						#threshold is in days
+      $file_details{preferred_unit_crit} = "days";					#define the preferred unit of time
+      $file_details{age}                 =  $file_details{age_days};			#save appropriate unit measurement
+      chop $crit_threshold;								#remove the trailing unit (days) so we can do integer comparisons
+   }											#end of if block
+   unless ( $file_details{preferred_unit_crit} =~ /[a-z]/ ) {					#confirm we have a valid unit 
+      print "$CHECK_NAME UNKNOWN - could not determine unit of measurement as seconds/minutes/hours/days.  Please check --warn=## --crit=## parameters. \n";
+      exit $UNKNOWN;
+   }											#end of unless block
+   #
+   # Confirm the unit of measurement for --warn= and --crit= are the same
+   # In other words, do not allow --warn=24h --crit=2d
+   #
+   unless ( $file_details{preferred_unit_warn} eq  $file_details{preferred_unit_crit} ) { 
+      print "$CHECK_NAME UNKNOWN - the unit of measurement for --warn=$file_details{preferred_unit_warn} and --crit=$file_details{preferred_unit_crit} must be the same, please use consistent seconds/minutes/hours/days units. \n";
+      exit $UNKNOWN;
+   }											#end of unless block
+}											#end of subroutine
+
+
+
+
+
+sub print_output {
+   #
+   print "Running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space.
+   # If you are pnp4nagios for graphing, each space-separated section will create a separate graph.
+   # UOM is Units Of Measurement.    Can be s=seconds m=minutes h=hours d=days
+   $perf_data = "file_age=$file_details{age}$file_details{preferred_unit_warn};$warn_threshold;$crit_threshold;0; ";
+   #
+   #
+   if ( $file_details{age} > $crit_threshold ) {
+      print "$CHECK_NAME CRITICAL - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_crit} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
+      exit $CRITICAL;
+   }											#end of if block
+   if ( $file_details{age} > $warn_threshold ) {
+      print "$CHECK_NAME WARN     - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
+      exit $WARN;
+   }											#end of if block
+   if ( $file_details{age} <= $warn_threshold ) {
+      print "$CHECK_NAME OK - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn}, warn at $warn_threshold $file_details{preferred_unit_warn}, critical at $crit_threshold $file_details{preferred_unit_crit} | $perf_data \n";
+      exit $OK;
+   }											#end of if block
+}											#end of subroutine
+
+
+
+
+# ---------------- main body of script -------------------------
+get_options;
+sanity_checks;
+get_file_age;
+verify_units;
+print_output;
+
