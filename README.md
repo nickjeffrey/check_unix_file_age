@@ -38,3 +38,8 @@ If using NRPE, you will also need a section defining the NRPE command in the /us
 ```
 command[check_file_age]=/usr/local/nagios/libexec/check_file_age
 ```
+
+
+# Output
+You will see output similar to one of the following messages
+<img src=images/file_age.png>
