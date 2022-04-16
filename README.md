@@ -4,7 +4,9 @@ nagios check for file last modification date on UNIX-like operating systems
 # Requirements
 perl
 
-nagios check for last file modification date for a specified file on UNIX-like operating systems.
+# Overview
+This is a nagios check for last file modification date for a specified file on UNIX-like operating systems.
+Used for checking things like the last time a backup logfile was updated.
 
 This script is executed remotely on a monitored system by the NRPE or check_by_ssh methods available in nagios.
 
