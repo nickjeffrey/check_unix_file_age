@@ -1,13 +1,14 @@
 #!/usr/bin/perl -w
 
 
-# nagios check to alert if a file last modification date is greater than X
-# used for checking things list the last time a backup logfile was updated
+# nagios check to alert if a file last modification date is greater than X or less than X
+# used for checking things list the last time a backup logfile was updated, or if a file that should *not* be modified has changed
 
  
 # CHANGE LOG
 # ----------
 #  2022/04/16	njeffrey	Script created
+#  2022/12/22	njeffrey	Add --older and --younger parameters 
 
 
 
@@ -107,11 +108,13 @@ my ($verbose);
 my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
 my ($perf_data);
 my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
-my ($opt_h,$opt_v,$opt_f,$opt_w,$opt_c,$opt_i);
+my ($opt_h,$opt_v,$opt_f,$opt_w,$opt_c,$opt_i,$opt_o,$opt_y);
 my ($file_name,$file_age,%file_details,$ignore);
 my ($warn_threshold,$crit_threshold);
 my ($default_warn_threshold,$default_crit_threshold);
+my ($check_type);
 $verbose            = "no";				#yes/no flag to increase verbosity during debugging
+$check_type         = "older";				#by default, alert if file is older than the threshold (change with --younger parameter)
 $perf_data          = "";                               #nagios performance data included in output
 $CHECK_NAME         = "File Age";
 $default_warn_threshold = 86400;			#default warn threshold is  86400 seconds (1 day)
@@ -141,6 +144,8 @@ sub get_options {
       "w=i" => \$opt_w, "warn=s"      => \$opt_w,
       "c=i" => \$opt_c, "crit=s"      => \$opt_c,
       "i"   => \$opt_i, "ignore"      => \$opt_i,
+      "o"   => \$opt_o, "older"       => \$opt_o,
+      "y"   => \$opt_y, "younger"     => \$opt_y,
    );
    #
    # If the user supplied the -h or --help switch, give them some help.
@@ -149,7 +154,9 @@ sub get_options {
       print "Use this syntax \n";
       print "   $0 \n";
       print "   $0 --file=/path/to/myfile.txt   (assumes nagios user has at least list access to file) \n";
-      print "   $0 --warn=24h --crit=48h        (alert thresholds s=seconds h=hours d=days, defaults to seconds if unit not provided) \n";
+      print "   $0 --warn=24h --crit=48h        (alert thresholds for files s=seconds h=hours d=days, defaults to seconds if unit not provided) \n";
+      print "   $0 --older                      (alert if file is OLDER   than the threshold, this is the default value)   \n";
+      print "   $0 --younger                    (alert if file is YOUNGER than the threshold)   \n";
       print "   $0 --ignore                     (do not alert if file is missing) \n";
       print "   $0 --verbose                    (increase output for debugging) \n";
       exit $UNKNOWN;				#exit script
@@ -180,6 +187,16 @@ sub get_options {
    # add section for --ignore
    if( defined( $opt_i ) ) {
       $ignore = "yes";
+   }
+   #
+   # add section for --older
+   if( defined( $opt_o ) ) {
+      $check_type = "older";
+   }
+   #
+   # add section for --younger
+   if( defined( $opt_y ) ) {
+      $check_type = "younger";
    }
    #
    # add section for --file=/path/to/myfile.txt
@@ -336,18 +353,38 @@ sub print_output {
    # UOM is Units Of Measurement.    Can be s=seconds m=minutes h=hours d=days
    $perf_data = "file_age=$file_details{age}$file_details{preferred_unit_warn};$warn_threshold;$crit_threshold;0; ";
    #
+   # run this section if the --older parameter was provided
    #
-   if ( $file_details{age} > $crit_threshold ) {
-      print "$CHECK_NAME CRITICAL - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_crit} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
-      exit $CRITICAL;
+   if ($check_type eq "older") {
+      if ( $file_details{age} > $crit_threshold ) {
+         print "$CHECK_NAME CRITICAL - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_crit} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
+         exit $CRITICAL;
+      }											#end of if block
+      if ( $file_details{age} > $warn_threshold ) {
+         print "$CHECK_NAME WARN     - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
+         exit $WARN;
+      }											#end of if block
+      if ( $file_details{age} <= $warn_threshold ) {
+         print "$CHECK_NAME OK - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn}, warn at $warn_threshold $file_details{preferred_unit_warn}, critical at $crit_threshold $file_details{preferred_unit_crit} | $perf_data \n";
+         exit $OK;
+      }											#end of if block
    }											#end of if block
-   if ( $file_details{age} > $warn_threshold ) {
-      print "$CHECK_NAME WARN     - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
-      exit $WARN;
-   }											#end of if block
-   if ( $file_details{age} <= $warn_threshold ) {
-      print "$CHECK_NAME OK - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn}, warn at $warn_threshold $file_details{preferred_unit_warn}, critical at $crit_threshold $file_details{preferred_unit_crit} | $perf_data \n";
-      exit $OK;
+   #
+   # run this section if the --younger parameter was provided
+   #
+   if ($check_type eq "younger") {
+      if ( $file_details{age} < $crit_threshold ) {
+         print "$CHECK_NAME CRITICAL - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_crit} ago. Please investigate why this file has been recently modified. | $perf_data \n";
+         exit $CRITICAL;
+      }											#end of if block
+      if ( $file_details{age} < $warn_threshold ) {
+         print "$CHECK_NAME WARN     - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn} ago. Please investigate why this file has been recently modified. | $perf_data \n";
+         exit $WARN;
+      }											#end of if block
+      if ( $file_details{age} >= $warn_threshold ) {
+         print "$CHECK_NAME OK - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn}, warn at $warn_threshold $file_details{preferred_unit_warn}, critical at $crit_threshold $file_details{preferred_unit_crit} | $perf_data \n";
+         exit $OK;
+      }											#end of if block
    }											#end of if block
 }											#end of subroutine
 
