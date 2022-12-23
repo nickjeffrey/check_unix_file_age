@@ -2,7 +2,7 @@
 nagios check for file last modification date on UNIX-like operating systems
 
 # Requirements
-perl
+perl, SSH key pair auth
 
 # Overview
 This is a nagios check for last file modification date for a specified file on UNIX-like operating systems.
@@ -10,14 +10,29 @@ Used for checking things like the last time a backup logfile was updated.
 
 This script is executed remotely on a monitored system by the NRPE or check_by_ssh methods available in nagios.
 
-If you are using the check_by_ssh method, you will need a section in the services.cfg file on the nagios server that looks similar to the following. This assumes that you already have ssh key pairs configured.
+If you are using the check_by_ssh method, you will need a section in the services.cfg file on the nagios server that looks similar to one of the following examples.
+This assumes that you already have ssh key pairs configured.
 ```
-# Define service for checking last modification time of a file
+# Define service for checking last modification time of a file(s) is no older than XXX time
+# This uses the --older parameter, so file(s) must be no older than the --warn threshold
+# An example of when to use the --older parameter is to warn if a backup logfile is not updated due to a missed backup job
 define service{
-        use                             generic-24x7-service
+        use                             generic-service
         host_name                       unix11
-        service_description             file age /path/to/myfile.txt
-        check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_file_age --file=/path/to/myfile.txt --warn=24h --crit=48h"
+        service_description             file age myfile.txt
+        check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_file_age --file=/path/to/myfile.txt --older --warn=24h --crit=48h"
+        }
+```
+
+```
+# Define service for checking last modification time of a file(s) is no older than XXX time
+# This uses the --younger parameter, so file(s) must be no younger than the --warn threshold
+# An example of when to use the --younger parameter is to be alerted if a file that should not be changed has been modified recently
+define service{
+        use                             generic-service
+        host_name                       unix11
+        service_description             file age /path/to/*.cfg
+        check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_file_age --file=/path/to/*.cfg --younger --warn=48h --crit=24h"
         }
 ```
 
