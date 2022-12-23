@@ -7,6 +7,17 @@ nagios check for file last modification date on UNIX-like operating systems
 # Requirements
 perl, SSH key pair auth
 
+# Usage 
+Use this syntax:
+```
+   check_unix_file_age --file=/path/to/myfile.txt   (single   file check, assumes userid has at least list access to file)
+   check_unix_file_age --file=/path/to/*.txt        (wildcard file check, assumes userid has at least list access to files)
+   check_unix_file_age --warn=24h --crit=48h        (alert thresholds for files s=seconds h=hours d=days, defaults to seconds if unit not provided)
+   check_unix_file_age --older                      (alert if file is OLDER   than the threshold, this is the default value)
+   check_unix_file_age --younger                    (alert if file is YOUNGER than the threshold)
+   check_unix_file_age --ignore                     (do not alert if file is missing)
+   check_unix_file_age --verbose                    (increase output for debugging)
+```
 # Overview
 This is a nagios check for last file modification date for a specified file on UNIX-like operating systems.
 Used for checking things like the last time a backup logfile was updated.
