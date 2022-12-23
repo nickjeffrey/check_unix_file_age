@@ -1,7 +1,7 @@
 # check_unix_file_age
 nagios check for file last modification date on UNIX-like operating systems
  - Alerts if a file last modification date is greater than XXX or less than XXX
- - Useful for checking things list the last time a backup logfile was updated, or if a file that should no* be modified has changed recently, sort of like a poor man's tripwire.
+ - Useful for checking things list the last time a backup logfile was updated, or if a file that should not be modified has changed recently, sort of like a poor man's tripwire.
 
 
 # Requirements
