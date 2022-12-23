@@ -1,8 +1,17 @@
 #!/usr/bin/perl -w
 
-
 # nagios check to alert if a file last modification date is greater than X or less than X
 # used for checking things list the last time a backup logfile was updated, or if a file that should *not* be modified has changed
+
+
+
+
+# OUTSTANDING TASKS
+# -----------------
+#  The low-priviliged nagios userid needs to have enough filesystem permission to get the datestamp of the filename, so this check cannot be used for files that have locked-down permissions (ie root user only)
+#  Add a parameter to supply the list of filenames from an external file, maybe add something to the .cfg file like list-of-filenames=read_from_some_external_file
+
+
 
  
 # CHANGE LOG
@@ -17,37 +26,49 @@
 # NOTES
 # -----
 #
-#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
-#  methods available in nagios.
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh  methods available in nagios.
 #
 #  There is an "official" nagios plugin called check_file_age, which can be installed with yum install nagios-plugins-file_age
 #  However, the official plugin has dependencies on multiple perl moduules that do not exist on all UNIX-like operating systems,
 #  so this plugin requires nothing but base perl, so is easier to use on non-Linux systems like AIX.
 #
-#  If you are using the check_by_ssh method, you will need a section in the services.cfg
-#  file on the nagios server that looks similar to the following.
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg  file on the nagios server that looks similar to one of the following examples.
 #  This assumes that you already have ssh key pairs configured.
-#   # Define service for checking last modification time of a file
+#
+#   # Define service for checking last modification time of a file(s) is no older than XXX time
+#   # This uses the --older parameter, so file(s) must be no older than the --warn threshold
+#   # An example of when to use the --older parameter is to warn if a backup logfile is not updated due to a missed backup job
 #   define service{
-#           use                             generic-24x7-service
+#           use                             generic-service
 #           host_name                       unix11
 #           service_description             file age myfile.txt
-#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_file_age --file=/path/to/myfile.txt --warn=24h --crit=48h"
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_file_age --file=/path/to/myfile.txt --older --warn=24h --crit=48h"
 #           }
+#
+#   # Define service for checking last modification time of a file(s) is no younger than XXX time
+#   # This uses the --younger parameter, so file(s) must be no younger than the --warn threshold
+#   # An example of when to use the --younger parameter is to be alerted if a file that should not be changed has been modified recently
+#   define service{
+#           use                             generic-service
+#           host_name                       unix11
+#           service_description             file age /path/to/*.cfg
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_unix_file_age --file=/path/to/*.cfg --younger --warn=48h --crit=24h"
+#           }
+#
 #
 #  If you are using the check_nrpe method, you will need a section in the services.cfg
 #  file on the nagios server that looks similar to the following.
 #  This assumes that you already have ssh key pairs configured.
 #   # Define service for checking time synchronization
 #   define service{
-#           use                             generic-24x7-service
+#           use                             generic-service
 #           host_name                       unix11
 #           service_description             file age myfile.txt
 #           check_command                   check_nrpe!check_unix_file_age -t 30
 #           }
 #
 #  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
-#   command[check_file_age]=/usr/local/nagios/libexec/check_file_age
+#   command[check_file_age]=/usr/local/nagios/libexec/check_unix_file_age
 #
 #
 
@@ -106,16 +127,18 @@ use Getopt::Long;                       		#allow --long-switches to be used as p
 #declare variables
 my ($verbose);
 my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
-my ($perf_data);
+my ($perf_data,$common_output_data);
 my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
-my ($opt_h,$opt_v,$opt_f,$opt_w,$opt_c,$opt_i,$opt_o,$opt_y);
-my ($file_name,$file_age,%file_details,$ignore);
+my ($opt_h,$opt_v,$opt_f,$opt_W,$opt_w,$opt_c,$opt_i,$opt_o,$opt_y);
+my ($file_name,$file_age,%file_details,@filenames,$filename_count,$ignore);
 my ($warn_threshold,$crit_threshold);
 my ($default_warn_threshold,$default_crit_threshold);
 my ($check_type);
+my ($key,$error_count_warn,$error_count_crit,$error_count_ok);
 $verbose            = "no";				#yes/no flag to increase verbosity during debugging
 $check_type         = "older";				#by default, alert if file is older than the threshold (change with --younger parameter)
 $perf_data          = "";                               #nagios performance data included in output
+$common_output_data = "";
 $CHECK_NAME         = "File Age";
 $default_warn_threshold = 86400;			#default warn threshold is  86400 seconds (1 day)
 $default_crit_threshold = 172800;			#default warn threshold is 172800 seconds (2 days)
@@ -139,7 +162,7 @@ sub get_options {
    Getopt::Long::Configure('bundling');
    GetOptions(
       "h"   => \$opt_h, "help"        => \$opt_h,
-      "v"   => \$opt_v, "verbose"      => \$opt_v,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
       "f=s" => \$opt_f, "file=s"      => \$opt_f,
       "w=i" => \$opt_w, "warn=s"      => \$opt_w,
       "c=i" => \$opt_c, "crit=s"      => \$opt_c,
@@ -153,7 +176,8 @@ sub get_options {
    if( defined( $opt_h ) ) {
       print "Use this syntax \n";
       print "   $0 \n";
-      print "   $0 --file=/path/to/myfile.txt   (assumes nagios user has at least list access to file) \n";
+      print "   $0 --file=/path/to/myfile.txt   (single   file check, assumes userid has at least list access to file) \n";
+      print "   $0 --file=/path/to/*.txt        (wildcard file check, assumes userid has at least list access to files) \n";
       print "   $0 --warn=24h --crit=48h        (alert thresholds for files s=seconds h=hours d=days, defaults to seconds if unit not provided) \n";
       print "   $0 --older                      (alert if file is OLDER   than the threshold, this is the default value)   \n";
       print "   $0 --younger                    (alert if file is YOUNGER than the threshold)   \n";
@@ -202,8 +226,10 @@ sub get_options {
    # add section for --file=/path/to/myfile.txt
    if( defined( $opt_f ) ) {
       $file_name = $opt_f;
-   } else {
-      print "$CHECK_NAME UNKNOWN - filename not provided with --file=path/to/filename.txt, use --help parameter for help. \n";
+   } 
+   #
+   if(!(defined( $opt_f )) ) {
+      print "$CHECK_NAME UNKNOWN: must provide --file=??? parameter.  Use $0 --help to get examples. \n";
      exit $UNKNOWN;
    }		
 }                       #end of subroutine
@@ -216,44 +242,79 @@ sub sanity_checks {
    #
    print "Running sanity_checks subroutine \n" if ($verbose eq "yes");
    #
-   # If the file does not exist, and the --ignore parameter was provided, exit script
-   if ( (! -f "$file_name") && (defined($ignore)) ) {
-      print "$CHECK_NAME OK - skipping file age check, $file_name does not exist \n";
-      exit $OK;
-   }
-   #
-   # confirm the file date can be determined by the current user
-   #
-   if ( ! -f "$file_name" ) {
-      print "$CHECK_NAME CRITICAL - Cannot find file $file_name \n";
-      exit $CRITICAL;
-   }
-   # We do not really care if the file contents are not readable, as long as we can get the file date
-   # In other words, having read or execute privilege will be enough to get the file date.
-   if ( (! -r "$file_name") && (! -x "$file_name") ) {  
-      print "$CHECK_NAME UNKNOWN -  $file_name is not readable or executable by the current user \n";
-      exit $UNKNOWN;
-   }
-
 }						#end of subroutine
 
 
 
-
-
-sub get_file_age {
+sub get_file_names {
    #
-   print "Running get_file_age subroutine \n" if ($verbose eq "yes");
+   print "Running get_file_names subroutine \n" if ($verbose eq "yes");
    #
-   ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($file_name); #get last modification time in seconds since the epoch
-   $file_age = time - $mtime;                                 				#figure out how many seconds old the file is
-   print "   file $file_name is $file_age seconds old \n" if ($verbose eq "yes");
-   $file_details{name}        = $file_name;						#save filename in hash
-   $file_details{age_seconds} = $file_age;						#save age in seconds in hash
-   $file_details{age_minutes} = sprintf( "%.0f",$file_details{age_seconds}/60);		#convert seconds to minutes, truncate to zero decimal places
-   $file_details{age_hours}   = sprintf( "%.0f",$file_details{age_seconds}/60/60);	#convert seconds to hours,   truncate to zero decimal places
-   $file_details{age_days}    = sprintf( "%.0f",$file_details{age_seconds}/60/60/24);	#convert seconds to days,    truncate to zero decimal places
+   # Get a list of all the filenames that match the filename or wildcard provided with the --file=/path/to/*.txt parameter
+   #
+   @filenames = glob("$file_name");					#get a list of all the filenames that match the wildcard
+   #
+   $key = 0;										#initialize counter variable (we use an integer as the hash key to avoid having / characters in the hash keys)
+   foreach $file_name (@filenames) {						#save filenames in a hash
+      $file_details{$key}{file_name} = $file_name;
+      print "   found filename $file_details{$key}{file_name} \n" if ($verbose eq "yes");
+      $key++;										#increment counter
+   } 											#end of foreach loop
+   #
+   # figure out how many filenames were detected
+   #
+   $filename_count = 0;
+   foreach $key (sort keys %file_details) {
+      $filename_count++;
+   }
+   #
+   # alert if zero filenames were detected
+   #
+   if ( ($filename_count == 0) && (defined($ignore)) ) {
+      print "$CHECK_NAME OK - skipping file age check, specified filename $file_name does not exist \n";
+      exit $OK;
+   }											#end of if block
+   if ( ($filename_count == 0) && (!defined($ignore)) ) {
+         print "$CHECK_NAME UNKNOWN - could not find file $file_name  \n";
+         exit $UNKNOWN;
+   }											#end of if block
+   #
+   # confirm sufficient permissions exist to get the file age
+   # We do not really care if the file contents are not readable, as long as we can get the file date
+   # In other words, having read or execute privilege will be enough to get the file date.
+   #
+   foreach $key (sort keys %file_details) {
+      if ( (! -r "$file_details{$key}{file_name}") && (! -x "$file_details{$key}{file_name}") ) {  
+         print "$CHECK_NAME UNKNOWN -  $file_details{$key}{file_name} is not readable or executable by the current user \n";
+         exit $UNKNOWN;
+      }
+   }											#end of foreach loop
 }											#end of subroutine
+
+
+
+
+
+sub get_file_ages {
+   #
+   print "Running get_file_ages subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # At this point, we have a hash containing all the filenames, so we can check the file datestamps one at a time
+   #
+   foreach $key (sort keys %file_details) {
+      ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks) = stat($file_details{$key}{file_name}); #get last modification time in seconds since the epoch
+      $file_details{$key}{age}         = time - $mtime;                       				#figure out how many seconds old the file is
+      $file_details{$key}{age_seconds} = $file_details{$key}{age};					#save age in seconds in hash
+      $file_details{$key}{age_minutes} = sprintf( "%.0f",$file_details{$key}{age_seconds}/60);		#convert seconds to minutes, truncate to zero decimal places
+      $file_details{$key}{age_hours}   = sprintf( "%.0f",$file_details{$key}{age_seconds}/60/60);	#convert seconds to hours,   truncate to zero decimal places
+      $file_details{$key}{age_days}    = sprintf( "%.0f",$file_details{$key}{age_seconds}/60/60/24);	#convert seconds to days,    truncate to zero decimal places
+      print "   file $file_details{$key}{file_name} age seconds:$file_details{$key}{age_seconds} minutes:$file_details{$key}{age_minutes} hours:$file_details{$key}{age_hours} days:$file_details{$key}{age_days} \n" if ($verbose eq "yes");
+      $key++;												#increment counter
+   }													#end of foreach loop
+}													#end of subroutine
+
+
 
 
 sub verify_units {
@@ -267,75 +328,156 @@ sub verify_units {
    #
    # Check the contents of the --warn= parameter
    #
-   if ( $warn_threshold =~ /[0-9]+$/ ) {						#threshold not provided, so assume it is seconds
-      $file_details{preferred_unit_warn} = "seconds";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
-   }											#end of if block
-   if ( $warn_threshold =~ /[0-9]+s/ ) {						#threshold is in seconds
-      $file_details{preferred_unit_warn} = "seconds";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
-      chop $warn_threshold;								#remove the trailing unit (seconds) so we can do integer comparisons
-   }											#end of if block
-   if ( $warn_threshold =~ /[0-9]+m/ )  {						#threshold is in minutes
-      $file_details{preferred_unit_warn} = "minutes";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_minutes};			#save appropriate unit measurement
-      chop $warn_threshold;								#remove the trailing unit (minutes) so we can do integer comparisons
-   }											#end of if block
-   if ( $warn_threshold =~ /[0-9]+h/ )  {						#threshold is in hours
-      $file_details{preferred_unit_warn} = "hours";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_hours};			#save appropriate unit measurement
-      chop $warn_threshold;								#remove the trailing unit (hours) so we can do integer comparisons
-   }											#end of if block
-   if ( $warn_threshold =~ /[0-9]+d/ )  {						#threshold is in days
-      $file_details{preferred_unit_warn} = "days";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_days};			#save appropriate unit measurement
-      chop $warn_threshold;								#remove the trailing unit (days) so we can do integer comparisons
-   }											#end of if block
-   unless ( $file_details{preferred_unit_warn} =~ /[a-z]/ ) {				#confirm we have a valid unit 
-      print "$CHECK_NAME UNKNOWN - could not determine unit of measurement as seconds/minutes/hours/days.  Please check --warn=## --crit=## parameters. \n";
-      exit $UNKNOWN;
-   }											#end of unless block
+   foreach $key (sort keys %file_details) {
+      $file_details{$key}{warn_threshold}          = $warn_threshold;			#define the preferred unit of time
+      if ( $file_details{$key}{warn_threshold}     =~ /[0-9]+$/ ) {			#threshold not provided, so assume it is seconds
+         $file_details{$key}{warn_threshold_units} = "seconds";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_seconds};	#save appropriate unit measurement
+      }											#end of if block
+      if ( $file_details{$key}{warn_threshold}     =~ /[0-9]+s/ ) {			#threshold is in seconds
+         $file_details{$key}{warn_threshold_units} = "seconds";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_seconds};	#save appropriate unit measurement
+         chop $file_details{$key}{warn_threshold};					#remove the trailing unit (seconds) so we can do integer comparisons
+      }											#end of if block
+      if ( $file_details{$key}{warn_threshold}     =~ /[0-9]+m/ )  {			#threshold is in minutes
+         $file_details{$key}{warn_threshold_units} = "minutes";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_minutes};	#save appropriate unit measurement
+         chop $file_details{$key}{warn_threshold};					#remove the trailing unit (minutes) so we can do integer comparisons
+      }											#end of if block
+      if ( $file_details{$key}{warn_threshold}     =~ /[0-9]+h/ )  {			#threshold is in hours
+         $file_details{$key}{warn_threshold_units} = "hours";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_hours};	#save appropriate unit measurement
+         chop $file_details{$key}{warn_threshold};					#remove the trailing unit (hours) so we can do integer comparisons
+      }											#end of if block
+      if ( $file_details{$key}{warn_threshold}     =~ /[0-9]+d/ )  {			#threshold is in days
+         $file_details{$key}{warn_threshold_units} = "days";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_days};	#save appropriate unit measurement
+         chop $file_details{$key}{warn_threshold};					#remove the trailing unit (days) so we can do integer comparisons
+      }											#end of if block
+      unless ( $file_details{$key}{warn_threshold_units} =~ /[a-z]/ ) {			#confirm we have a valid unit 
+         print "$CHECK_NAME UNKNOWN - could not determine unit of measurement as seconds/minutes/hours/days.  Please check --warn=## --crit=## parameters. \n";
+         exit $UNKNOWN;
+      }											#end of unless block
+      print "   checking filename $file_details{$key}{file_name} age:$file_details{$key}{age}  warn_thresh:$file_details{$key}{warn_threshold} $file_details{$key}{warn_threshold_units} \n" if ($verbose eq "yes");
+   }											#end of foreach loop
    #
    # Check the contents of the --crit= parameter
    #
-   if ( $crit_threshold =~ /[0-9]+$/ ) {						#threshold not provided, so assume it is seconds
-      $file_details{preferred_unit_crit} = "seconds";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
-   }											#end of if block
-   if ( $crit_threshold =~ /[0-9]+s/ ) {						#threshold is in seconds
-      $file_details{preferred_unit_crit} = "seconds";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_seconds};			#save appropriate unit measurement
-      chop $crit_threshold;								#remove the trailing unit (seconds) so we can do integer comparisons
-   }											#end of if block
-   if ( $crit_threshold =~ /[0-9]+m/ )  {						#threshold is in minutes
-      $file_details{preferred_unit_crit} = "minutes";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_minutes};			#save appropriate unit measurement
-      chop $crit_threshold;								#remove the trailing unit (minutes) so we can do integer comparisons
-   }											#end of if block
-   if ( $crit_threshold =~ /[0-9]+h/ )  {						#threshold is in hours
-      $file_details{preferred_unit_crit} = "hours";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_hours};			#save appropriate unit measurement
-      chop $crit_threshold;								#remove the trailing unit (hours) so we can do integer comparisons
-   }											#end of if block
-   if ( $crit_threshold =~ /[0-9]+d/ )  {						#threshold is in days
-      $file_details{preferred_unit_crit} = "days";					#define the preferred unit of time
-      $file_details{age}                 =  $file_details{age_days};			#save appropriate unit measurement
-      chop $crit_threshold;								#remove the trailing unit (days) so we can do integer comparisons
-   }											#end of if block
-   unless ( $file_details{preferred_unit_crit} =~ /[a-z]/ ) {					#confirm we have a valid unit 
-      print "$CHECK_NAME UNKNOWN - could not determine unit of measurement as seconds/minutes/hours/days.  Please check --warn=## --crit=## parameters. \n";
-      exit $UNKNOWN;
-   }											#end of unless block
+   foreach $key (sort keys %file_details) {
+      $file_details{$key}{crit_threshold}          = $crit_threshold;			#define the preferred unit of time
+      if ( $file_details{$key}{crit_threshold}     =~ /[0-9]+$/ ) {			#threshold not provided, so assume it is seconds
+         $file_details{$key}{crit_threshold_units} = "seconds";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_seconds};	#save appropriate unit measurement
+      }											#end of if block
+      if ( $file_details{$key}{crit_threshold}     =~ /[0-9]+s/ ) {			#threshold is in seconds
+         $file_details{$key}{crit_threshold_units} = "seconds";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_seconds};	#save appropriate unit measurement
+         chop $file_details{$key}{crit_threshold};					#remove the trailing unit (seconds) so we can do integer comparisons
+      }											#end of if block
+      if ( $file_details{$key}{crit_threshold}     =~ /[0-9]+m/ )  {			#threshold is in minutes
+         $file_details{$key}{crit_threshold_units} = "minutes";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_minutes};	#save appropriate unit measurement
+         chop $file_details{$key}{crit_threshold};					#remove the trailing unit (minutes) so we can do integer comparisons
+      }											#end of if block
+      if ( $file_details{$key}{crit_threshold}     =~ /[0-9]+h/ )  {			#threshold is in hours
+         $file_details{$key}{crit_threshold_units} = "hours";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_hours};	#save appropriate unit measurement
+         chop $file_details{$key}{crit_threshold};					#remove the trailing unit (hours) so we can do integer comparisons
+      }											#end of if block
+      if ( $file_details{$key}{crit_threshold}     =~ /[0-9]+d/ )  {			#threshold is in days
+         $file_details{$key}{crit_threshold_units} = "days";				#define the preferred unit of time
+         $file_details{$key}{age}                  = $file_details{$key}{age_days};	#save appropriate unit measurement
+         chop $file_details{$key}{crit_threshold};					#remove the trailing unit (days) so we can do integer comparisons
+      }											#end of if block
+      unless ( $file_details{$key}{crit_threshold_units} =~ /[a-z]/ ) {			#confirm we have a valid unit 
+         print "$CHECK_NAME UNKNOWN - could not determine unit of measurement as seconds/minutes/hours/days.  Please check --warn=## --crit=## parameters. \n";
+         exit $UNKNOWN;
+      }											#end of unless block
+      print "   checking filename $file_details{$key}{file_name} age:$file_details{$key}{age}  crit_thresh:$file_details{$key}{crit_threshold} $file_details{$key}{crit_threshold_units} \n" if ($verbose eq "yes");
+   }											#end of foreach loop
    #
    # Confirm the unit of measurement for --warn= and --crit= are the same
    # In other words, do not allow --warn=24h --crit=2d
    #
-   unless ( $file_details{preferred_unit_warn} eq  $file_details{preferred_unit_crit} ) { 
-      print "$CHECK_NAME UNKNOWN - the unit of measurement for --warn=$file_details{preferred_unit_warn} and --crit=$file_details{preferred_unit_crit} must be the same, please use consistent seconds/minutes/hours/days units. \n";
-      exit $UNKNOWN;
-   }											#end of unless block
+   foreach $key (sort keys %file_details) {
+      unless ( $file_details{$key}{warn_threshold_units} eq  $file_details{$key}{crit_threshold_units} ) { 
+         print "$CHECK_NAME UNKNOWN - the unit of measurement for --warn=$file_details{$key}{warn_threshold_units} and --crit=$file_details{$key}{crit_threshold_units} must be the same, please use consistent seconds/minutes/hours/days units. \n";
+         exit $UNKNOWN;
+      }											#end of unless block
+   }											#end of foreach loop
 }											#end of subroutine
 
+
+
+
+sub check_for_problems {
+   #
+   print "Running check_for_problems subroutine \n" if ($verbose eq "yes");
+   #
+   $error_count_crit = 0;								#initialize counter variable
+   $error_count_warn = 0;								#initialize counter variable
+   $error_count_ok   = 0;								#initialize counter variable
+   foreach $key (sort keys %file_details) {
+      #
+      # run this section if the --older parameter was provided
+      #
+      if ($check_type eq "older") {
+         $file_details{$key}{check_type} = "older";
+         unless ( $file_details{$key}{warn_threshold} < $file_details{$key}{crit_threshold} ) { 
+            print "$CHECK_NAME UNKNOWN - when the --older parameter is used, --warn=## must be less than --crit=## \n";
+            exit $UNKNOWN
+         }
+         if ( $file_details{$key}{age} >=  $file_details{$key}{crit_threshold} ) { 
+            $file_details{$key}{critical} = "yes"; 
+            $file_details{$key}{output_message} = "filename $file_details{$key}{file_name} last modification date is $file_details{$key}{age} $file_details{$key}{crit_threshold_units} ago, should be less than $warn_threshold $file_details{$key}{warn_threshold_units} ago, please investigate why this file has not been updated recently.";
+            print "   $file_details{$key}{file_name} age $file_details{$key}{age} $file_details{$key}{crit_threshold_units} is CRITICAL \n" if ($verbose eq "yes");
+            $error_count_crit++;
+         }
+         if ( ($file_details{$key}{age} >=  $file_details{$key}{warn_threshold}) && ($file_details{$key}{age} <  $file_details{$key}{crit_threshold}) ) {
+            $file_details{$key}{warn}     = "yes"; 
+            $file_details{$key}{output_message} = "filename $file_details{$key}{file_name} last modification date is $file_details{$key}{age} $file_details{$key}{crit_threshold_units} ago, should be less than $warn_threshold $file_details{$key}{warn_threshold_units} ago, please investigate why this file has not been updated recently.";
+            print "   $file_details{$key}{file_name} age $file_details{$key}{age} $file_details{$key}{warn_threshold_units} is WARN \n" if ($verbose eq "yes");
+            $error_count_warn++;
+         }
+         if ( $file_details{$key}{age} <= $file_details{$key}{warn_threshold} ) { 
+            $file_details{$key}{critical} = "no" ; 
+            $file_details{$key}{warn}     = "no" ; 
+            $file_details{$key}{output_message} = "filename $file_details{$key}{file_name} last modification date is $file_details{$key}{age} $file_details{$key}{warn_threshold_units}, warn at $warn_threshold $file_details{$key}{warn_threshold_units}, critical at $crit_threshold $file_details{$key}{crit_threshold_units}";
+            print "   $file_details{$key}{file_name} age $file_details{$key}{age} $file_details{$key}{warn_threshold_units} is OK \n" if ($verbose eq "yes");
+            $error_count_ok++;
+         }
+      }											#end of if block
+      #
+      # run this section if the --younger parameter was provided
+      #
+      if ($check_type eq "younger") {
+         $file_details{$key}{check_type} = "younger";
+         unless ( $file_details{$key}{warn_threshold} > $file_details{$key}{crit_threshold} ) { 
+            print "$CHECK_NAME UNKNOWN - when the --younger parameter is used, --warn=## must be more than --crit=## \n";
+            exit $UNKNOWN
+         }
+         if ( $file_details{$key}{age} <=  $file_details{$key}{crit_threshold} ) { 
+            $file_details{$key}{critical} = "yes"; 
+            $file_details{$key}{output_message} = "filename $file_details{$key}{file_name} last modification date is $file_details{$key}{age} $file_details{$key}{crit_threshold_units} ago. Please investigate why this file has been recently modified.";
+            print "   $file_details{$key}{file_name} age $file_details{$key}{age} $file_details{$key}{crit_threshold_units} is CRITICAL \n" if ($verbose eq "yes");
+            $error_count_crit++;
+         }
+         if ( ($file_details{$key}{age} <=  $file_details{$key}{warn_threshold}) && ($file_details{$key}{age} >  $file_details{$key}{warn_threshold})) { 
+            $file_details{$key}{warn}     = "yes"; 
+            $file_details{$key}{output_message} = "filename $file_details{$key}{file_name} last modification date is $file_details{$key}{age} $file_details{$key}{crit_threshold_units} ago. Please investigate why this file has been recently modified.";
+            print "   $file_details{$key}{file_name} age $file_details{$key}{age} $file_details{$key}{warn_threshold_units} is WARN \n" if ($verbose eq "yes");
+            $error_count_warn++;
+         }
+         if ( $file_details{$key}{age} >= $file_details{$key}{warn_threshold} ) { 
+            $file_details{$key}{critical} = "no"; 
+            $file_details{$key}{warn}     = "no" ; 
+            $file_details{$key}{output_message} = "filename $file_details{$key}{file_name} last modification date is $file_details{$key}{age} $file_details{$key}{warn_threshold_units}, warn at $warn_threshold $file_details{$key}{warn_threshold_units}, critical at $crit_threshold $file_details{$key}{crit_threshold_units} ";
+            print "   $file_details{$key}{file_name} age $file_details{$key}{age} $file_details{$key}{warn_threshold_units} is OK \n" if ($verbose eq "yes");
+            $error_count_ok++;
+         }
+      }											#end of if block
+   }											#end of foreach loop
+}											#end of subroutine
 
 
 
@@ -351,41 +493,130 @@ sub print_output {
    # You can have multiple items of perf data, just separate each section with a space.
    # If you are pnp4nagios for graphing, each space-separated section will create a separate graph.
    # UOM is Units Of Measurement.    Can be s=seconds m=minutes h=hours d=days
-   $perf_data = "file_age=$file_details{age}$file_details{preferred_unit_warn};$warn_threshold;$crit_threshold;0; ";
+   #
+   $perf_data = "";
+   foreach $key (sort keys %file_details) {
+      $perf_data = "$perf_data file_age_$file_details{$key}{warn_threshold_units}=$file_details{$key}{age};$file_details{$key}{warn_threshold};$file_details{$key}{crit_threshold};0; ";
+   }
+   $perf_data = "" if ($filename_count >= 2);		#no performance data availalble if there are multiple filenames
+   #
+   # 
    #
    # run this section if the --older parameter was provided
    #
    if ($check_type eq "older") {
-      if ( $file_details{age} > $crit_threshold ) {
-         print "$CHECK_NAME CRITICAL - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_crit} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
+      if ($error_count_crit == 1) {
+         print "$CHECK_NAME CRITICAL - found one file that is too old. ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{critical} eq "yes") { 
+               $common_output_data = "$common_output_data $file_details{$key}{output_message}"; 
+            }
+         }
+         print " $common_output_data | $perf_data \n";
          exit $CRITICAL;
-      }											#end of if block
-      if ( $file_details{age} > $warn_threshold ) {
-         print "$CHECK_NAME WARN     - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn} ago, should be less than $warn_threshold $file_details{preferred_unit_warn} ago, please investigate why this file has not been updated recently. | $perf_data \n";
+      }
+      if ($error_count_warn == 1) {
+         print "$CHECK_NAME WARN - found one file that is too old. ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{warn} eq "yes") { 
+               $common_output_data = "$common_output_data $file_details{$key}{output_message}"; 
+            }
+         }
+         print " $common_output_data | $perf_data \n";
          exit $WARN;
-      }											#end of if block
-      if ( $file_details{age} <= $warn_threshold ) {
-         print "$CHECK_NAME OK - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn}, warn at $warn_threshold $file_details{preferred_unit_warn}, critical at $crit_threshold $file_details{preferred_unit_crit} | $perf_data \n";
-         exit $OK;
-      }											#end of if block
-   }											#end of if block
+      }
+      if ($error_count_crit >  1) {
+         print "$CHECK_NAME CRITICAL - found multiple files that are too old: ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{critical} eq "yes") { 
+               $common_output_data = "$common_output_data $file_details{$key}{file_name}"; 
+            }
+         }
+         print " $common_output_data | $perf_data \n";
+         exit $CRITICAL;
+      }
+      if ($error_count_warn >  1) {
+         print "$CHECK_NAME WARN - found multiple files that are too old: ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{warn}     eq "yes") {
+               $common_output_data = "$common_output_data $file_details{$key}{file_name}"; 
+            }
+         }
+         print " $common_output_data | $perf_data \n";
+         exit $WARN;
+      }
+   }
    #
    # run this section if the --younger parameter was provided
    #
    if ($check_type eq "younger") {
-      if ( $file_details{age} < $crit_threshold ) {
-         print "$CHECK_NAME CRITICAL - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_crit} ago. Please investigate why this file has been recently modified. | $perf_data \n";
+      if ($error_count_crit == 1) {
+         print "$CHECK_NAME CRITICAL - found one file that is too young. ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{critical} eq "yes") { 
+               $common_output_data = "$common_output_data $file_details{$key}{output_message}"; 
+            }
+         }
+         print " $common_output_data | $perf_data \n";
          exit $CRITICAL;
-      }											#end of if block
-      if ( $file_details{age} < $warn_threshold ) {
-         print "$CHECK_NAME WARN     - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn} ago. Please investigate why this file has been recently modified. | $perf_data \n";
+      }
+      if ($error_count_warn == 1) {
+         print "$CHECK_NAME WARN - found one file that is too young. ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{warn}     eq "yes") { 
+               $common_output_data = "$common_output_data $file_details{$key}{output_message}";
+            }
+         }
+         print " $common_output_data | $perf_data \n";
          exit $WARN;
-      }											#end of if block
-      if ( $file_details{age} >= $warn_threshold ) {
-         print "$CHECK_NAME OK - filename $file_details{name} last modification date is $file_details{age} $file_details{preferred_unit_warn}, warn at $warn_threshold $file_details{preferred_unit_warn}, critical at $crit_threshold $file_details{preferred_unit_crit} | $perf_data \n";
+      }
+      if ($error_count_crit >  1) {
+         print "$CHECK_NAME CRITICAL - found multiple files that are too young: ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{critical} eq "yes") { 
+               $common_output_data = "$common_output_data $file_details{$key}{file_name}"; 
+            }
+         }
+         print " $common_output_data | $perf_data \n";
+         exit $CRITICAL;
+      }
+      if ($error_count_warn >  1) {
+         print "$CHECK_NAME WARN - found multiple files that are too young: ";
+         foreach $key (sort keys %file_details) {
+            if ($file_details{$key}{warn}     eq "yes") {
+               $common_output_data = "$common_output_data $file_details{$key}{file_name}"; 
+            }
+         }
+         print " $common_output_data | $perf_data \n";
+         exit $WARN;
+      }
+   }
+   #
+   # run this section if all the file age values are ok
+   #
+   if ( ($error_count_crit == 0) && ($error_count_warn == 0) ) {
+      if ($error_count_ok == 1) {
+         print "$CHECK_NAME OK - ";
+         foreach $key (sort keys %file_details) {
+            $common_output_data = "$common_output_data $file_details{$key}{output_message}"; 
+         }
+         print " $common_output_data | $perf_data \n";
          exit $OK;
-      }											#end of if block
-   }											#end of if block
+      }
+      if ($error_count_ok > 1) {
+         print "$CHECK_NAME OK - ";
+         foreach $key (sort keys %file_details) {
+            $common_output_data = "$common_output_data $file_details{$key}{file_name}"; 
+         }
+         print " $common_output_data | $perf_data \n";
+         exit $OK;
+      }
+   }
+   #
+   # should never get this far
+   #
+   print "$CHECK_NAME UNKNOWN - inconceivable output! $common_output_data  | $perf_data \n";
+   exit $UNKNOWN;
 }											#end of subroutine
 
 
@@ -394,7 +625,9 @@ sub print_output {
 # ---------------- main body of script -------------------------
 get_options;
 sanity_checks;
-get_file_age;
+get_file_names;
+get_file_ages;
 verify_units;
+check_for_problems;
 print_output;
 
