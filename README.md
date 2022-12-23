@@ -6,6 +6,7 @@ nagios check for file last modification date on UNIX-like operating systems
 
 # Requirements
 perl, SSH key pair auth
+low-privilege nagios userid must be able "stat" the file to query the last modification date (so cannot read files with locked-down permissions)
 
 # Usage 
 Use this syntax:
