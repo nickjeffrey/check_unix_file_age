@@ -55,7 +55,7 @@ If you are using the check_nrpe method, you will need a section in the services.
 file on the nagios server that looks similar to the following.
 This assumes that you already have ssh key pairs configured.
 ```
- Define service for checking last modification time of a file 
+# Define service for checking last modification time of a file 
 define service{
         use                             generic-service
         host_name                       unix11
