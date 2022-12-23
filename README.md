@@ -25,7 +25,7 @@ define service{
 ```
 
 ```
-# Define service for checking last modification time of a file(s) is no older than XXX time
+# Define service for checking last modification time of a file(s) is no younger than XXX time
 # This uses the --younger parameter, so file(s) must be no younger than the --warn threshold
 # An example of when to use the --younger parameter is to be alerted if a file that should not be changed has been modified recently
 define service{
